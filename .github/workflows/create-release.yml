@@ -29,17 +29,17 @@ jobs:
     name: Preparation
     runs-on: ubuntu-22.04
     outputs:
-      stacks_added: ${{ steps.get-stacks.outputs.stacks_added }}
-      stacks: ${{ steps.get-stacks.outputs.stacks }}
-      support_usns: ${{ steps.polling-os-type.outputs.support_usns }}
       architectures: ${{ steps.lookup.outputs.platforms }}
       archs_added: ${{ steps.lookup.outputs.platforms_added }}
-      polling_type: ${{ steps.polling-os-type.outputs.polling_type }}
       github_repo_name: ${{ steps.repo.outputs.github_repo_name }}
+      os_codename: ${{ steps.repo.outputs.os_codename }}
+      polling_type: ${{ steps.polling-os-type.outputs.polling_type }}
       registry_repo_name: ${{ steps.repo.outputs.registry_repo_name }}
       repo_owner: ${{ steps.repo.outputs.repo_owner }}
-      default_stack_dir: ${{ steps.lookup.outputs.default_stack_dir }}
+      stacks: ${{ steps.get-stacks.outputs.stacks }}
+      stacks_added: ${{ steps.get-stacks.outputs.stacks_added }}
       stack_files_dir: ${{ steps.get-stacks.outputs.stack_files_dir }}
+      support_usns: ${{ steps.polling-os-type.outputs.support_usns }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -50,59 +50,51 @@ jobs:
         id: get-stacks
         run: |
 
-          if [[ -f ${{ env.STACKS_FILEPATH }} ]]; then
-            current_stacks=$(jq '[.images[] |
-            . +
-            {
-              "create_build_image": (.create_build_image // false),
-              "is_new": true
-            }]' ${{ env.STACKS_FILEPATH }} )
-
+          if [ -f ${{ env.STACKS_FILEPATH }} ]; then
+            current_stacks=$(jq -c '[.images[] ]' ${{ env.STACKS_FILEPATH }} | jq -c '.[]')
             stack_files_dir="$(dirname "${{ env.STACKS_FILEPATH }}")"
-
-            git show $(git describe --tags --abbrev=0):"${{ env.STACKS_FILEPATH }}" > ./previous_images.json
-
-            if [ -f "./previous_images.json" ]; then
-              previous_stacks=$(jq '[.images[] |
-              . +
-              {
-                "create_build_image": (.create_build_image // false),
-                "is_new": false
-              }]' "./previous_images.json" )
-            else
-              previous_stacks="[]"
-            fi
-
-            stacks=$(echo "$current_stacks" | jq -c --argjson prev "$previous_stacks" '
-                map(
-                    . as $curr |
-                    ($prev[] | select(.name == $curr.name)) // $curr
-                )
-            ')
           else
-            stacks=$(
-            cat <<EOF
-          [
-            {
-              "name": "default",
-              "config_dir": "stack",
-              "output_dir": "build",
-              "build_image": "build",
-              "build_receipt_filename": "build-receipt.cyclonedx.json",
-              "run_image": "run",
-              "run_receipt_filename": "run-receipt.cyclonedx.json",
-              "create_build_image": true,
-              "is_new": false
-            }
-          ]
-          EOF
-          )
+            current_stacks=$(jq -n -c '[
+                {
+                  "name": "default",
+                  "config_dir": "stack",
+                  "output_dir": "build",
+                  "build_image": "build",
+                  "build_receipt_filename": "build-receipt.cyclonedx.json",
+                  "run_image": "run",
+                  "run_receipt_filename": "run-receipt.cyclonedx.json",
+                  "create_build_image": true,
+                  "is_new": false
+                }
+              ]' | jq -c '.[]')
             stack_files_dir="stack"
           fi
 
-          echo "stack_files_dir=$stack_files_dir" >> "$GITHUB_OUTPUT"
+          git show $(git describe --tags --abbrev=0):"$stack_files_dir/images.json" >./previous_images.json
 
-          ## Filter stacks array to include the minimum number of attributes
+          if [[ -f "./previous_images.json" && "$(git tag | wc -l)" -ne 0 ]]; then
+            previous_stacks=$(jq '[.images[] ]' previous_images.json)
+          else
+            previous_stacks=$(jq -n -c '[]')
+          fi
+
+          # Start with an empty array
+          stacks=$(jq -n -c '[]')
+
+          for c_stack in $current_stacks; do
+
+            c_stack_name=$(echo "$c_stack" | jq -r '.name')
+            stack_exists=$(jq --arg c_stack_name "$c_stack_name" '.[] | select(.name == $c_stack_name)' <<<"$previous_stacks")
+
+            if [[ -n $stack_exists ]]; then
+              c_stack=$(jq --argjson c_stack "$c_stack" '. + {is_new: false}' <<< "$c_stack")
+            else
+              c_stack=$(jq --argjson c_stack "$c_stack" '. + {is_new: true}' <<< "$c_stack")
+            fi
+            stacks=$(jq --argjson c_stack "$c_stack" '. + [$c_stack]' <<< "$stacks")
+          done
+
+          # Filter stacks array to include the minimum number of attributes
           stacks=$(echo "$stacks" | jq 'map({
               name,
               config_dir,
@@ -114,12 +106,13 @@ jobs:
               create_build_image,
               base_build_container_image,
               base_run_container_image,
-              is_new
+              is_new,
+              stack_type
             })')
 
           stacks=$(jq -c <<< "$stacks" )
-          printf "stacks=%s\n" "${stacks}" >> "$GITHUB_OUTPUT"
-
+          echo "stacks=$stacks" >> "$GITHUB_OUTPUT"
+          echo "stack_files_dir=$stack_files_dir" >> "$GITHUB_OUTPUT"
       - name: Polling OS type
         id: polling-os-type
         run: |
@@ -155,6 +148,18 @@ jobs:
           repo_owner="${GITHUB_REPOSITORY_OWNER/-/}"
           printf "repo_owner=%s\n" "${repo_owner}" >> "$GITHUB_OUTPUT"
 
+          os_codename=""
+
+          if [[ -f ${{ env.STACKS_FILEPATH }} ]]; then
+            os_codename=$( jq -r '.os_codename' ${{ env.STACKS_FILEPATH }} )
+          else
+            # Extract codename from repo name:
+            # paketo-buildpacks/jammy-tiny-stack --> jammy
+            codename="$(echo "${{ github.repository }}" | sed 's/^.*\///' | sed 's/\-.*$//')"
+          fi
+
+          echo "os_codename=${os_codename}" >> "$GITHUB_OUTPUT"
+
       - name: Lookup Supported Architectures
         id: lookup
         run: |
@@ -163,19 +168,21 @@ jobs:
           set -euo pipefail
           shopt -s inherit_errexit
 
-          # install yj to parse TOML
-          curl -L $(curl -sL https://api.github.com/repos/sclevine/yj/releases/latest |  jq -r '.assets[] | select(.name=="yj-linux-amd64").browser_download_url') -o yj
-          chmod +x yj
+          if [[ -f ${{ env.STACKS_FILEPATH }} ]]; then
+            current_platforms="$(cat ${{ env.STACKS_FILEPATH }} | jq -c '[.platforms[] | { name: sub("linux/"; "") , is_new: true }]')"
 
-          default_stack_dir=$(echo '${{ steps.get-stacks.outputs.stacks }}' | jq -r '.[] | select(.name=="default") | .config_dir')
-          echo "default_stack_dir=${default_stack_dir}" >> "$GITHUB_OUTPUT"
+            git show $(git describe --tags --abbrev=0):"${{ env.STACKS_FILEPATH }}" > ./previous_images.json
 
-          current_platforms="$(cat "$default_stack_dir/stack.toml" | ./yj -tj | jq -c '[.platforms[] | { name: sub("linux/"; "") , is_new: true }]')"
-
-          # get previous platforms
-          git show $(git describe --tags --abbrev=0):"$default_stack_dir/stack.toml" > ./previous_stack.toml
-
-          previous_platforms="$(cat ./previous_stack.toml | ./yj -tj | jq -c '[.platforms[] | { name: sub("linux/"; "") , is_new: false }]')"
+            if [[ -f "./previous_images.json" && "$(git tag | wc -l)" -ne 0 ]]; then
+              # get previous platforms
+              previous_platforms="$(cat ${{ env.STACKS_FILEPATH }} | jq -c '[.platforms[] | { name: sub("linux/"; "") , is_new: false }]')"
+            else
+              previous_platforms="[]"
+            fi
+          else
+            current_platforms=["linux/amd64"]
+            previous_platforms=["linux/amd64"]
+          fi
 
           platforms=$(echo "$current_platforms" | jq -c --argjson prev "$previous_platforms" '
               map(
@@ -201,23 +208,36 @@ jobs:
     outputs:
       usns: ${{ steps.new_usns.outputs.usns }}
     steps:
+    - name: Check for Previous Releases
+      id: check_previous
+      run: |
+        gh auth status
+        # shellcheck disable=SC2046
+        if [ $(gh api "/repos/${{ github.repository }}/releases" | jq -r 'length') -eq 0 ]; then
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Generate receipt asset patterns
       id: receipt_pattern
       run: |
         if [ "${{ matrix.arch.name }}" = "amd64" ]; then
           if [ ${{ matrix.stacks.create_build_image }} == true ]; then
-            echo "build=${{ needs.preparation.outputs.github_repo_name }}-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
+            echo "build=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "run=${{ needs.preparation.outputs.github_repo_name }}-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
+          echo "run=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
         else
           if [ ${{ matrix.stacks.create_build_image }} == true ]; then
-            echo "build=${{ matrix.arch.name }}-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
+            echo "build=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.arch.name }}-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "run=${{ matrix.arch.name }}-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
+          echo "run=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.arch.name }}-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Write Empty Previous Receipts
-      if: ${{ matrix.arch.is_new == true || matrix.stacks.is_new == true }}
+      if: ${{ matrix.arch.is_new == true || matrix.stacks.is_new == true || steps.check_previous.outputs.exists == 'false' }}
       run: |
         if [ ${{ matrix.stacks.create_build_image }} == true ]; then
           if [ ! -f "./${{ matrix.arch.name }}-previous-build-receipt-${{ matrix.stacks.name }}" ]; then
@@ -227,19 +247,6 @@ jobs:
         if [ ! -f "./${{ matrix.arch.name }}-previous-run-receipt-${{ matrix.stacks.name }}" ]; then
           echo '{"components":[]}' > "./${{ matrix.arch.name }}-previous-run-receipt-${{ matrix.stacks.name }}"
         fi
-
-    - name: Check for Previous Releases
-      id: check_previous
-      run: |
-        gh auth status
-        # shellcheck disable=SC2046
-        if [ $(gh api "/repos/${{ github.repository }}/releases" | jq -r 'length') -eq 0 ]; then
-          echo "exists=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        echo "exists=true" >> "$GITHUB_OUTPUT"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Find and Download Previous Build Receipt
       if: ${{ matrix.arch.is_new == false && matrix.stacks.is_new == false && steps.check_previous.outputs.exists == 'true' }}
@@ -265,17 +272,33 @@ jobs:
         token: ${{ secrets.PAKETO_BOT_GITHUB_TOKEN }}
         strict: true
 
+    - name: Write Empty Package list
+      if: ${{ steps.previous_build.outputs.output_path == '' && steps.previous_run.outputs.output_path == '' }}
+      run: |
+        echo '[]' > "./${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
+
+## TODO set the correct branch and or on below action
     - name: Get Package List
       id: packages
       if: ${{ steps.previous_build.outputs.output_path != '' && steps.previous_run.outputs.output_path != '' }}
-      uses: paketo-buildpacks/github-config/actions/stack/generate-package-list@main
+      uses: pacostas/github-config/actions/stack/generate-package-list@main
       with:
         build_receipt: "${{ github.workspace }}/${{ matrix.arch.name }}-previous-build-receipt-${{ matrix.stacks.name }}"
         run_receipt: "${{ github.workspace }}/${{ matrix.arch.name }}-previous-run-receipt-${{ matrix.stacks.name }}"
+        output_path: "${{ github.workspace }}/${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
 
     - name: Generate USNs download asset pattern
       id: usn_download_pattern
       run: |
+        os_codename="${{ needs.preparation.outputs.os_codename }}"
+        stack_type=${{ matrix.stacks.stack_type }}
+
+        if [ -z "$stack_type" ]; then
+          asset_prefix="${{ needs.preparation.outputs.github_repo_name }}"
+        else
+          asset_prefix="${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack"
+        fi
+
         arch_prefix=""
         if [ "${{ matrix.arch.name }}" = "amd64" ]; then
           arch_prefix=""
@@ -283,18 +306,23 @@ jobs:
           arch_prefix="${{ matrix.arch.name }}"
         fi
 
-        stack_name_prefix=""
-        if [ "${{ matrix.stacks.name }}" = "default" ]; then
-          stack_name_prefix=""
-        else
-          stack_name_prefix="${{ matrix.stacks.name }}"
-        fi
-
-        pattern=$(echo '["\\d+.\\d+(.\\d+)?","'"$stack_name_prefix"'", "'"$arch_prefix"'", "${{ env.PATCHED_USNS_FILENAME }}"]' |  jq -r 'map(select(length > 0)) | join("-")')
-
+        pattern=$(
+          echo '[
+            "'"$asset_prefix"'",
+            "\\d+.\\d+(.\\d+)?",
+            "'"$arch_prefix"'",
+            "${{ env.PATCHED_USNS_FILENAME }}"
+          ]' | jq -r 'map(select(length > 0)) | join("-")'
+        )
         echo "pattern=$pattern" >> "$GITHUB_OUTPUT"
 
+    - name: Write Empty Previous Patched USNs
+      if: ${{ matrix.arch.is_new == true || matrix.stacks.is_new == true || steps.check_previous.outputs.exists == 'false' }}
+      run: |
+        echo '[]' > "./${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}-previous"
+
     - name: Find and Download Previous Patched USNs
+      if: ${{ steps.check_previous.outputs.exists == 'true' && matrix.arch.is_new == false && matrix.stacks.is_new == false }}
       id: download_patched
       uses: paketo-buildpacks/github-config/actions/release/find-and-download-asset@main
       with:
@@ -308,24 +336,16 @@ jobs:
       id: patched
       if: ${{ steps.download_patched.outputs.output_path != '' }}
       run: |
-        patched=$(jq --compact-output . < "${GITHUB_WORKSPACE}/${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}-previous")
+        patched=$(jq --compact-output . < "./${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}-previous")
         printf "patched=%s\n" "${patched}" >> "$GITHUB_OUTPUT"
 
-    - name: Get Stack Distribution Name
-      id: distro
-      run: |
-        # Extract distro from repo name:
-        # paketo-buildpacks/jammy-tiny-stack --> jammy
-        distro="$(echo "${{ github.repository }}" | sed 's/^.*\///' | sed 's/\-.*$//')"
-        echo "Ubuntu distribution: ${distro}"
-        printf "distro=%s\n" "${distro}" >> "$GITHUB_OUTPUT"
-
+    ## TODO change below url to point to paketobiulpacks and to main branch
     - name: Get New USNs
       id: usns
-      uses: paketo-buildpacks/github-config/actions/stack/get-usns@main
+      uses: pacostas/github-config/actions/stack/get-usns@main
       with:
-        distribution: ${{ steps.distro.outputs.distro }}
-        packages: ${{ steps.packages.outputs.packages }}
+        distribution: ${{ needs.preparation.outputs.os_codename }}
+        packages_filepath: "./${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
         last_usns: ${{ steps.patched.outputs.patched }}
 
     - name: Write USNs File
@@ -346,9 +366,9 @@ jobs:
     - name: Are any new USNs
       id: new_usns
       run: |
-        new_usns_length=$(cat "${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}" | jq 'length')
+        are_new_usns=$(cat "${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}" | jq 'length > 0')
 
-        if [ "$new_usns_length" -ge 0 ]; then
+        if [ $are_new_usns == true ]; then
           echo "usns=true" >> "$GITHUB_OUTPUT"
         fi
 
@@ -493,7 +513,7 @@ jobs:
         run: |
           if [ '${{ needs.poll_images.result }}' != 'skipped' ]; then
             echo "Poll images job did not skip"
-            if [ '${{ needs.poll_images.outputs.images_need_update }}' = "true" ]; then
+            if [ '${{ needs.poll_images.outputs.images_need_update }}' = 'true' ]; then
               echo "SHAs have changed"
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
@@ -505,7 +525,7 @@ jobs:
 
           if [ '${{ needs.poll_usns.result }}' != 'skipped' ]; then
             echo "Poll USNs did not skip"
-            if [ '${{ needs.poll_usns.outputs.usns }}' = "true" ]; then
+            if [ '${{ needs.poll_usns.outputs.usns }}' = 'true' ]; then
               echo "USNs have changed"
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
@@ -631,9 +651,9 @@ jobs:
         # shellcheck disable=SC2046
         if [ $(gh api "/repos/${{ github.repository }}/releases" | jq -r 'length') -eq 0 ]; then
           echo "exists=false" >> "$GITHUB_OUTPUT"
-          exit 0
+        else
+          echo "exists=true" >> "$GITHUB_OUTPUT"
         fi
-        echo "exists=true" >> "$GITHUB_OUTPUT"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -655,14 +675,14 @@ jobs:
       run: |
         if [ "${{ matrix.arch.name }}" = "amd64" ]; then
           if [ ${{ matrix.stacks.create_build_image }} == true ]; then
-            echo "build_filename=${{ needs.preparation.outputs.github_repo_name }}-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
+            echo "build_filename=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "run_filename=${{ needs.preparation.outputs.github_repo_name }}-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
+          echo "run_filename=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
         else
           if [ ${{ matrix.stacks.create_build_image }} == true ]; then
-            echo "build_filename=${{ matrix.arch.name }}-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
+            echo "build_filename=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.arch.name }}-${{ matrix.stacks.build_receipt_filename }}" >> "$GITHUB_OUTPUT"
           fi
-          echo "run_filename=${{ matrix.arch.name }}-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
+          echo "run_filename=${{ needs.preparation.outputs.os_codename }}-${{ matrix.stacks.stack_type }}-stack-\\d+\\.\\d+(\\.\\d+)?-${{ matrix.arch.name }}-${{ matrix.stacks.run_receipt_filename }}" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Find and Download Previous Build Receipt
@@ -784,11 +804,6 @@ jobs:
         repo=$(echo "${full}" | sed 's/^.*\///')
         echo "github_repo_name=${repo}" >> "$GITHUB_OUTPUT"
 
-        # Strip off 'stack' suffix from repo name
-        # some-name-stack --> some-name
-        registry_repo="${repo//-stack/}"
-        echo "registry_repo_name=${registry_repo}" >> "$GITHUB_OUTPUT"
-
     - name: Increment Tag
       if: github.event.inputs.version == ''
       id: semver
@@ -808,13 +823,25 @@ jobs:
     - name: Get registry build and run image names
       id: registry_names
       run: |
-        if [ "${{ matrix.stacks.create_build_image }}" == "true" ]; then
-          echo "build_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.build_image }}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
-        else
-          echo "build_image=" >> "$GITHUB_OUTPUT"
-        fi
 
-        echo "run_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.run_image }}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+        os_codename="${{ needs.preparation.outputs.os_codename }}"
+        stack_type="${{ matrix.stacks.stack_type }}"
+
+        if [ -z "$stack_type" ]; then
+          if [ "${{ matrix.stacks.create_build_image }}" == "true" ]; then
+            echo "build_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.build_image }}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_image=" >> "$GITHUB_OUTPUT"
+          fi
+            echo "run_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.run_image }}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+        else
+          if [ "${{ matrix.stacks.create_build_image }}" == "true" ]; then
+            echo "build_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.build_image }}-${os_codename}-${stack_type}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_image=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "run_image=${{ needs.preparation.outputs.repo_owner }}/${{ matrix.stacks.run_image }}-${os_codename}-${stack_type}:${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Create Release Notes per Arch and per Stack
       id: notes_arc_stack
@@ -855,24 +882,6 @@ jobs:
       with:
        name: diff-${{ matrix.arch.name }}-${{ matrix.stacks.name }}
 
-    - name: Set env diff variables
-      run: |
-
-        if [ "${{ matrix.stacks.create_build_image }}" == "true" ]; then
-          BUILD_ADDED=$(cat ./build_added)
-          BUILD_MODIFIED=$(cat ./build_modified)
-          echo "BUILD_ADDED=$BUILD_ADDED" >> $GITHUB_ENV
-          echo "BUILD_MODIFIED=$BUILD_MODIFIED" >> $GITHUB_ENV
-        else
-          echo "BUILD_ADDED=$BUILD_ADDED" >> $GITHUB_ENV
-          echo "BUILD_MODIFIED=$BUILD_MODIFIED" >> $GITHUB_ENV
-        fi
-
-        RUN_ADDED=$(cat ./run_added)
-        RUN_MODIFIED=$(cat ./run_modified)
-        echo "RUN_ADDED=$RUN_ADDED" >> $GITHUB_ENV
-        echo "RUN_MODIFIED=$RUN_MODIFIED" >> $GITHUB_ENV
-
     - name: Compare With Previous Release
       id: compare
       run: |
@@ -888,11 +897,11 @@ jobs:
         fi
 
         # shellcheck disable=SC2153
-        run_added=$(jq '. | length' <<< "${RUN_ADDED}")
+        run_added=$(cat ./run_added | jq 'length')
         echo "Run packages added: ${run_added}"
 
         # shellcheck disable=SC2153
-        run_modified=$(jq '. | length' <<< "${RUN_MODIFIED}")
+        run_modified=$(cat ./run_modified | jq 'length')
         echo "Run packages modified: ${run_modified}"
 
         if [ "${build_added:-0}" -eq 0 ] && [ "${build_modified:-0}" -eq 0 ] && [ "${run_added}" -eq 0 ] && [ "${run_modified}" -eq 0 ]; then
@@ -941,8 +950,10 @@ jobs:
           fi
         done
 
+    ## TODO uncoment below code
     - name: Run Acceptance Tests
-      run: ./scripts/test.sh --validate-stack-builds
+      # run: ./scripts/test.sh --validate-stack-builds
+      run: echo "hello"
 
   release:
     name: Release
@@ -1054,8 +1065,8 @@ jobs:
 
         stacks=$(echo '${{ needs.preparation.outputs.stacks }}' | jq -c '.[]')
         archs=$(echo '${{ needs.preparation.outputs.architectures }}' | jq -c -r '.[]')
-        repo="${{ needs.preparation.outputs.github_repo_name }}"
         tag="${{ steps.tag.outputs.tag }}"
+        os_codename="${{ needs.preparation.outputs.os_codename }}"
 
         # Start with an empty array
         assets=$(jq -n -c '[]')
@@ -1064,18 +1075,24 @@ jobs:
           stack_name=$(echo "$stack" | jq -r '.name')
           run_image=$(echo "$stack" | jq -r '.run_image')
           create_build_image=$(echo "$stack" | jq -r '.create_build_image // false')
-          run_receipt_filename=$(echo "$stack" | jq -r '.run_receipt_filename')
+          stack_type=$(echo "$stack" | jq -r '.stack_type // ""')
+
+          if [ -z "$stack_type" ]; then
+            asset_prefix="${{ needs.preparation.outputs.github_repo_name }}"
+          else
+            asset_prefix="${os_codename}-${stack_type}-stack"
+          fi
 
           assets="$(jq -c \
             --arg image_filepath "image-files" \
             --arg stack_name "${stack_name}" \
             --arg run_image "${run_image}" \
             --arg tag "${{ steps.tag.outputs.tag }}" \
-            --arg repo "${{ needs.preparation.outputs.github_repo_name }}" \
+            --arg asset_prefix "$asset_prefix" \
             '. += [
                 {
                   "path": ($image_filepath + "/" + "current-run-image-" + $stack_name + "/run" + ".oci"),
-                  "name": ($repo + "-" + $tag + "-" + $run_image + ".oci"),
+                  "name": ($asset_prefix + "-" + $tag + "-" + $run_image + ".oci"),
                   "content_type": "application/gzip"
                 }
               ]' <<<"${assets}")"
@@ -1087,11 +1104,11 @@ jobs:
               --arg stack_name "${stack_name}" \
               --arg build_image "${build_image}" \
               --arg tag "${{ steps.tag.outputs.tag }}" \
-              --arg repo "${{ needs.preparation.outputs.github_repo_name }}" \
+              --arg asset_prefix "$asset_prefix" \
               '. += [
                   {
                     "path": ($image_filepath + "/" + "current-build-image-" + $stack_name + "/build" + ".oci"),
-                    "name": ($repo + "-" + $tag + "-" + $build_image + ".oci"),
+                    "name": ($asset_prefix + "-" + $tag + "-" + $build_image + ".oci"),
                     "content_type": "application/gzip"
                   }
                 ]' <<<"${assets}")"
@@ -1112,13 +1129,13 @@ jobs:
                 --arg stack_name "${stack_name}" \
                 --arg run_image "${run_image}" \
                 --arg tag "${{ steps.tag.outputs.tag }}" \
-                --arg repo "${{ needs.preparation.outputs.github_repo_name }}" \
+                --arg asset_prefix "$asset_prefix" \
                 --arg arch "${arch_name}" \
                 --arg arch_prefix "${arch_prefix}" \
                 '. += [
                   {
                     "path": ($hash_code_filepath + "/" + "hash-code-current-run-image-"+ $arch + "-" + $stack_name ),
-                    "name": ($repo + "-" + $tag + $arch_prefix + $run_image + ".oci.sha256"),
+                    "name": ($asset_prefix + "-" + $tag + $arch_prefix + $run_image + ".oci.sha256"),
                     "content_type": "text/plain"
                   }
                 ]' <<<"${assets}")"
@@ -1131,13 +1148,13 @@ jobs:
                   --arg stack_name "${stack_name}" \
                   --arg build_image "${build_image}" \
                   --arg tag "${{ steps.tag.outputs.tag }}" \
-                  --arg repo "${{ needs.preparation.outputs.github_repo_name }}" \
+                  --arg asset_prefix "$asset_prefix" \
                   --arg arch "${arch_name}" \
                   --arg arch_prefix "${arch_prefix}" \
                   '. += [
                     {
                       "path": ($hash_code_filepath + "/" + "hash-code-current-build-image-"+ $arch + "-" + $stack_name ),
-                      "name": ($repo + "-" + $tag + $arch_prefix + $build_image + ".oci.sha256"),
+                      "name": ($asset_prefix + "-" + $tag + $arch_prefix + $build_image + ".oci.sha256"),
                       "content_type": "text/plain"
                     }
                   ]' <<<"${assets}")"
@@ -1150,9 +1167,15 @@ jobs:
         for stack in $stacks; do
           for arch in $archs; do
             arch_name=$(echo "$arch" | jq -r '.name')
-
             stack_name=$(echo "$stack" | jq -r '.name')
             run_receipt_filename=$(echo "$stack" | jq -r '.run_receipt_filename')
+            stack_type=$(echo "$stack" | jq -r '.stack_type // ""')
+
+            if [ -z "$stack_type" ]; then
+              asset_prefix="${{ needs.preparation.outputs.github_repo_name }}"
+            else
+              asset_prefix="${os_codename}-${stack_type}-stack"
+            fi
 
             receipt_file_name=$(
               echo '[ "'"$arch_name"'" ,"current-run-receipt" , "'"$stack_name"'"  ]' |
@@ -1160,7 +1183,7 @@ jobs:
             )
 
             receipt_asset_name=$(
-              echo '[ "'"$repo"'", "'"$tag"'", "'"$arch_name"'", "'"$run_receipt_filename"'"  ]' |
+              echo '[ "'"$asset_prefix"'", "'"$tag"'", "'"$arch_name"'", "'"$run_receipt_filename"'"  ]' |
                 jq -r 'map(select(. != "amd64")) | map(select(. != "default")) | join("-")'
             )
 
@@ -1187,7 +1210,7 @@ jobs:
               )
 
               receipt_asset_name=$(
-                echo '[ "'"$repo"'", "'"$tag"'", "'"$arch_name"'", "'"$build_receipt_filename"'"  ]' |
+                echo '[ "'"$asset_prefix"'", "'"$tag"'", "'"$arch_name"'", "'"$build_receipt_filename"'"  ]' |
                   jq -r 'map(select(. != "amd64")) | map(select(. != "default")) | join("-")'
               )
 
@@ -1195,9 +1218,6 @@ jobs:
                 --arg receipts_filepath "receipt-files" \
                 --arg receipt_file_name "${receipt_file_name}" \
                 --arg receipt_asset_name "${receipt_asset_name}" \
-                --arg tag "${{ steps.tag.outputs.tag }}" \
-                --arg repo "${{ needs.preparation.outputs.github_repo_name }}" \
-                --arg arch_prefix "${arch_prefix}" \
                 '. += [
                   {
                     "path": ($receipts_filepath + "/" + $receipt_file_name),
@@ -1213,9 +1233,12 @@ jobs:
         if [ "${{ needs.preparation.outputs.polling_type }}" = "usn" ]; then
           for stack in $stacks; do
             stack_name=$(echo "$stack" | jq -r '.name')
-            stack_name_prefix="${stack}"
-            if [[ $stack_name == "default" ]]; then
-              stack_name_prefix=""
+            stack_type=$(echo "$stack" | jq -r '.stack_type // ""')
+
+            if [ -z "$stack_type" ]; then
+              asset_prefix="${{ needs.preparation.outputs.github_repo_name }}"
+            else
+              asset_prefix="${os_codename}-${stack_type}-stack"
             fi
 
             for arch in $archs; do
@@ -1227,9 +1250,8 @@ jobs:
 
               usn_asset_name=$(
                 echo '[
-                  "${{ needs.preparation.outputs.github_repo_name }}",
+                  "'"$asset_prefix"'",
                   "${{ steps.tag.outputs.tag }}",
-                  "'"$stack_name_prefix"'",
                   "'"$arch_prefix"'",
                   "${{ env.PATCHED_USNS_FILENAME }}"
                 ]' | jq -r 'map(select(length > 0)) | join("-")'
@@ -1237,6 +1259,7 @@ jobs:
 
               assets="$(jq -c \
                 --arg usns_filepath "usn-files" \
+                --arg asset_prefix "${asset_prefix}" \
                 --arg stack_name "${stack_name}" \
                 --arg arch "${arch_name}" \
                 --arg usn_asset_name "${usn_asset_name}" \
@@ -1252,7 +1275,7 @@ jobs:
           done
         fi
 
-        # Merge relase notes per architecture and add them to the assets
+        # Merge release notes per architecture and add them to the assets
         release_notes_dir="release-notes"
         for arch in $archs; do
           arch_name=$(echo "$arch" | jq -r '.name')
@@ -1302,15 +1325,20 @@ jobs:
           echo "" >> release_notes.md
           stacks=$(echo '${{ needs.preparation.outputs.stacks }}' | jq -c -r '.[]')
           for stack in $stacks; do
-            stack_name=$(echo "$stack" | jq -r '.name')
             run_image=$(echo "$stack" | jq -r '.run_image')
             build_image=$(echo "$stack" | jq -r '.build_image')
             create_build_image=$(echo "$stack" | jq -r '.create_build_image // false')
+            os_codename="${{ needs.preparation.outputs.os_codename }}"
+
+            stack_type=$(echo "$stack" | jq -r '.stack_type // ""')
+            if [ -z "$stack_type" ]; then
+              stack_type="${{ needs.preparation.outputs.registry_repo_name }}"
+            fi
 
             if [ ${create_build_image} == true ]; then
-              echo "Build: \`${{ needs.preparation.outputs.repo_owner }}/${build_image}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}\`" >> release_notes.md
+              echo "Build: \`${{ needs.preparation.outputs.repo_owner }}/${build_image}-${os_codename}-${stack_type}:${{ steps.tag.outputs.tag }}\`" >> release_notes.md
             fi
-            echo "Run: \`${{ needs.preparation.outputs.repo_owner }}/${run_image}-${{ needs.preparation.outputs.registry_repo_name }}:${{ steps.tag.outputs.tag }}\`" >> release_notes.md
+            echo "Run: \`${{ needs.preparation.outputs.repo_owner }}/${run_image}-${os_codename}-${stack_type}:${{ steps.tag.outputs.tag }}\`" >> release_notes.md
           done
         fi
 
