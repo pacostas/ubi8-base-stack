@@ -36,7 +36,6 @@ type StackImages struct {
 
 type ImagesJson struct {
 	SupportUsns       bool          `json:"support_usns"`
-	UpdateOnNewImage  bool          `json:"update_on_new_image"`
 	ReceiptsShowLimit int           `json:"receipts_show_limit"`
 	StackImages       []StackImages `json:"images"`
 }
