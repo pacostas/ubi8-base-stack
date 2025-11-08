@@ -5,7 +5,7 @@ See Paketo's [stacks documentation](https://paketo.io/docs/concepts/stacks/).
 
 ## What is this stack for?
 Ideal for:
-- Node.js/Java apps *with* or *witnnnnnhout* native extensions
+- Node.js/Java apps *with* or *without* native extensions
 
 ## What's in the build and run images of this stack?
 This stack's build and run images are based on ubi8 and contain many common libraries and utilities.
