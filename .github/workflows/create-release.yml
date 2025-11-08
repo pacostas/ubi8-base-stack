@@ -193,12 +193,12 @@ jobs:
             previous_platforms='[{"name": "amd64", "is_new": false}]'
           fi
 
-          platforms=$(echo "$current_platforms" | jq -c --argjson prev "$previous_platforms" '
+          platforms=$(echo "$current_platforms" | jq -c --argjson prev "$previous_platforms" "
               map(
-                  . as $curr |
-                  ($prev[] | select(.name == $curr.name)) // $curr
+                  . as \$curr |
+                  (\$prev[] | select(.name == \$curr.name)) // \$curr
               )
-          ')
+          ")
 
           echo "current_platforms=$current_platforms"
           echo "previous_platforms=$previous_platforms"
